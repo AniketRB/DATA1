@@ -1,124 +1,57 @@
-# DATA1
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
-from .models import AttendanceRecord, UnknownFaceLog
-from users.models import Faculty, Department
-from django.utils import timezone
-import os
-
-
-@api_view(['GET'])
+@api_view(['POST'])
 @permission_classes([IsAuthenticated])
-def today_attendance(request):
-    today = timezone.now().date()
-    records = AttendanceRecord.objects.filter(
-        date=today
-    ).select_related('faculty', 'faculty__department').order_by('check_in_time')
+def reregister_face(request, faculty_id):
+    try:
+        faculty = Faculty.objects.get(id=faculty_id)
+    except Faculty.DoesNotExist:
+        return Response({'error': 'Faculty not found'}, status=404)
 
-    data = [{
-        'faculty_name': r.faculty.name,
-        'employee_id': r.faculty.employee_id,
-        'department': r.faculty.department.name if r.faculty.department else '',
-        'check_in_time': r.check_in_time.strftime('%I:%M %p'),
-        'status': r.status,
-        'photo': r.faculty.photo.url if r.faculty.photo else None
-    } for r in records]
+    image_file = request.FILES.get('image')
+    image_base64 = request.data.get('image_base64')
 
-    total = Faculty.objects.filter(is_active=True).count()
-    present = len(data)
-    # Absent can never be negative
-    absent = max(0, total - present)
+    if image_file:
+        file_bytes = np.frombuffer(image_file.read(), dtype=np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        image_file.seek(0)
+    elif image_base64:
+        img = decode_base64_image(image_base64)
+    else:
+        return Response({'error': 'Image required'}, status=400)
 
-    return Response({
-        'date': today.strftime('%d %B %Y'),
-        'total_faculty': total,
-        'present': present,
-        'absent': absent,
-        'records': data
-    })
+    embedding = get_embedding(img)
+    if embedding is None:
+        return Response({'error': 'No face detected'}, status=400)
 
+    # Update face embedding
+    FaceEmbedding.objects.filter(faculty=faculty).delete()
+    FaceEmbedding.objects.create(
+        faculty=faculty,
+        embedding=embedding_to_json(embedding)
+    )
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def attendance_report(request):
-    date_from = request.query_params.get('date_from')
-    date_to = request.query_params.get('date_to')
-    department_id = request.query_params.get('department_id')
-    status_filter = request.query_params.get('status')
+    # Also update profile photo
+    if image_file:
+        # Delete old photo
+        if faculty.photo and os.path.isfile(faculty.photo.path):
+            os.remove(faculty.photo.path)
+        faculty.photo = image_file
+    elif image_base64:
+        b64_data = image_base64
+        if ',' in b64_data:
+            b64_data = b64_data.split(',')[1]
+        new_photo = ContentFile(
+            base64.b64decode(b64_data),
+            name=f'{faculty.employee_id}_photo.jpg'
+        )
+        # Delete old photo
+        if faculty.photo:
+            try:
+                if os.path.isfile(faculty.photo.path):
+                    os.remove(faculty.photo.path)
+            except Exception:
+                pass
+        faculty.photo = new_photo
 
-    records = AttendanceRecord.objects.select_related(
-        'faculty', 'faculty__department'
-    ).order_by('-date', 'check_in_time')
+    faculty.save()
 
-    if date_from:
-        records = records.filter(date__gte=date_from)
-    if date_to:
-        records = records.filter(date__lte=date_to)
-    if department_id:
-        records = records.filter(faculty__department_id=department_id)
-    if status_filter:
-        records = records.filter(status=status_filter)
-
-    data = [{
-        'faculty_name': r.faculty.name,
-        'employee_id': r.faculty.employee_id,
-        'department': r.faculty.department.name if r.faculty.department else '',
-        'date': r.date.strftime('%d %b %Y'),
-        'check_in_time': r.check_in_time.strftime('%I:%M %p'),
-        'status': r.status,
-    } for r in records]
-
-    return Response(data)
-
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def department_summary(request):
-    today = timezone.now().date()
-    departments = Department.objects.all()
-
-    data = []
-    for dept in departments:
-        total = Faculty.objects.filter(department=dept, is_active=True).count()
-        present = AttendanceRecord.objects.filter(
-            faculty__department=dept,
-            date=today
-        ).count()
-        # Absent can never be negative
-        absent = max(0, total - present)
-        data.append({
-            'department': dept.name,
-            'total': total,
-            'present': present,
-            'absent': absent,
-            'percentage': round((present / total * 100), 1) if total > 0 else 0
-        })
-
-    return Response(data)
-
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def unknown_faces(request):
-    logs = UnknownFaceLog.objects.order_by('-detected_at')[:20]
-    data = [{
-        'id': str(log.id),
-        'detected_at': log.detected_at.strftime('%d %b %Y %I:%M %p'),
-        'snapshot': log.snapshot.url if log.snapshot else None
-    } for log in logs]
-    return Response(data)
-
-
-@api_view(['DELETE'])
-@permission_classes([IsAuthenticated])
-def clear_unknown_faces(request):
-    """Delete all unknown face logs AND their image files from media folder"""
-    logs = UnknownFaceLog.objects.all()
-    for log in logs:
-        if log.snapshot:
-            # Delete actual file from disk
-            if os.path.isfile(log.snapshot.path):
-                os.remove(log.snapshot.path)
-    logs.delete()
-    return Response({'message': 'Cleared successfully'})
+    return Response({'message': 'Face and profile photo updated successfully'})
